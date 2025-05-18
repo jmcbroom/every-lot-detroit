@@ -30,7 +30,6 @@ def parse_facets(text: str) -> List[Dict]:
             "features": [
                 {
                     "$type": "app.bsky.richtext.facet#link",
-                    # NOTE: URI ("I") not URL ("L")
                     "uri": u["url"],
                 }
             ],
@@ -116,9 +115,6 @@ def post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=
             }
         }
         
-        # For a reply thread deeper than 1 level, you would need to distinguish 
-        # between root and parent, but this handles the common case of direct replies
-
     # Create the post
     response = client.com.atproto.repo.create_record(
         {
