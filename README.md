@@ -11,7 +11,11 @@ This repo contains code for the [everylot.det.city](https://bsky.app/profile/eve
 
 2. Adjust parameters in `everylot.py`:
   - FEATURE_SERVICE_URL: The URL of the feature service containing the parcels.
-  - PROJECT_PATH: The path to the project directory
-  - PYTHON_PATH: The path to the Python interpreter
 
-3. Run the script: `python everylot.py`
+3. Run the script: `python everylot.py`.
+
+4. You can also deploy this with GitHub Actions: see `.github/workflows/everylot.yml` for an example that posts every 30 minutes.
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE.md](LICENSE.md) file for details.
