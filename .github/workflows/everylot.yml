@@ -2,8 +2,8 @@ name: Every Lot Detroit Bot
 
 on:
   schedule:
-    - cron: '26,56 * * * *'  # Runs daily at 12:00 UTC
-  workflow_dispatch:  # Allows manual triggering
+    - cron: '26,56 * * * *'
+  workflow_dispatch:
 
 jobs:
   post-parcel:
