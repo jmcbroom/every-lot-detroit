@@ -1,0 +1,5 @@
+requests
+shapely
+atproto
+playwright
+pytest-playwright
