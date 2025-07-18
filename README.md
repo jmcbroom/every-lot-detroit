@@ -14,7 +14,7 @@ This repo contains code for the [everylot.det.city](https://bsky.app/profile/eve
 
 3. Run the script: `python everylot.py`.
 
-4. You can also deploy this with GitHub Actions: see `.github/workflows/everylot.yml` for an example that posts every 30 minutes.
+4. You can also deploy this with GitHub Actions: see `.github/workflows/everylot.yml` for an example that posts every 30 minutes. Note that Actions will stop running after 60 days of inactivity.
 
 ## License
 
