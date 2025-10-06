@@ -18,4 +18,4 @@ This repo contains code for the [everylot.det.city](https://bsky.app/profile/eve
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE.md](LICENSE.md) file for details.
+This project is licensed under the MIT License. See the [LICENSE.md](LICENSE.md) file for details
