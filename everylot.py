@@ -154,7 +154,7 @@ if __name__ == "__main__":
 
     # build up the reply text
     reply_text = [
-        f"Parcel info: https://base-unit-tools.netlify.app/map?id={parcel['properties']['parcel_id']}&layer=parcel"
+        f"Parcel info: https://baseunits.detroitmi.gov/map?id={parcel['properties']['parcel_id']}&layer=parcel"
     ]
 
     # Compute the parcel's centroid and get Mapillary images near it
