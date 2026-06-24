@@ -4,6 +4,7 @@ import random
 import requests
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from shapely.geometry import shape, Point
@@ -49,6 +50,24 @@ def get_parcel_count():
     response = requests.get(FEATURE_SERVICE_URL, params=params, timeout=30)
     response.raise_for_status()
     return response.json()["count"]
+
+
+def get_parcel_count_with_retry(attempts=3):
+    """Fetch the parcel count, retrying transient network errors with backoff.
+
+    This is the one fetch that runs before the per-parcel retry loop, so a single
+    transient hiccup here would otherwise crash the whole run before it starts.
+    """
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return get_parcel_count()
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            print(f"Parcel count fetch attempt {attempt}/{attempts} failed: {e}")
+            if attempt < attempts:
+                time.sleep(2 ** attempt)
+    raise last_error
 
 
 def get_random_parcel(parcel_count):
@@ -502,7 +521,7 @@ if __name__ == "__main__":
 
     # The parcel count doesn't change within a run, so fetch it once and reuse
     # it across attempts.
-    parcel_count = get_parcel_count()
+    parcel_count = get_parcel_count_with_retry()
 
     post_data = None
     for attempt in range(1, MAX_PARCEL_ATTEMPTS + 1):
