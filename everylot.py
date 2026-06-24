@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from shapely.geometry import shape
+from shapely.geometry import shape, Point
 
 from bearings import compute_viewer_center
 from bluesky import post_to_bluesky
@@ -15,6 +15,19 @@ from bluesky import post_to_bluesky
 PYTHON_PATH = sys.executable
 PROJECT_PATH = str(Path(__file__).parent.absolute())
 FEATURE_SERVICE_URL = "https://services2.arcgis.com/qvkbeam7Wirps6zC/arcgis/rest/services/parcel_file_current/FeatureServer/0/query"
+
+# Detroit BaseUnit services used to find a better vantage point for a parcel:
+# geocode the address -> street_id + building_id, then pull the matching street
+# centerline segment and building footprint. See plan: aim the camera at the
+# building, and rank Mapillary images by their distance to the street frontage
+# (so we favor front-of-house images over alley/cross-street ones).
+GEOCODER_URL = "https://opengis.detroitmi.gov/opengis/rest/services/BaseUnits/BaseUnitGeocoder/GeocodeServer/findAddressCandidates"
+CENTERLINE_URL = "https://services2.arcgis.com/qvkbeam7Wirps6zC/ArcGIS/rest/services/BaseUnitFeatures/FeatureServer/1/query"
+BUILDINGS_URL = "https://services2.arcgis.com/qvkbeam7Wirps6zC/ArcGIS/rest/services/BaseUnitFeatures/FeatureServer/2/query"
+
+# Geocoder candidates scoring below this are treated as a miss (we fall back to
+# the parcel centroid rather than trusting a weak match).
+GEOCODE_MIN_SCORE = 80
 
 # How many random parcels to try before giving up for this run. Most random
 # parcels won't have a Mapillary before/after pair, so we keep sampling until
@@ -74,6 +87,104 @@ def get_random_parcel(min_object_id, max_object_id):
     return features[0]
 
 
+def geocode_parcel(address):
+    """Geocode a parcel address via the Detroit BaseUnit geocoder.
+
+    Returns a dict {street_id, building_id, location, score} for the top
+    candidate, or None if there is no candidate clearing GEOCODE_MIN_SCORE or on
+    any network/parse error. Callers fall back to the parcel centroid on None.
+    """
+    params = {"SingleLine": address, "outFields": "*", "f": "json"}
+
+    try:
+        response = requests.get(GEOCODER_URL, params=params, timeout=30)
+        response.raise_for_status()
+        candidates = response.json().get("candidates", [])
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(f"Geocoder error for {address!r}: {e}")
+        return None
+
+    if not candidates:
+        print(f"No geocoder candidates for {address!r}")
+        return None
+
+    top = candidates[0]
+    score = top.get("score", 0)
+    if score < GEOCODE_MIN_SCORE:
+        print(f"Geocoder match for {address!r} too weak (score {score})")
+        return None
+
+    attributes = top.get("attributes", {})
+    location = top.get("location", {})
+    return {
+        "street_id": attributes.get("street_id"),
+        "building_id": attributes.get("building_id"),
+        "location": (location.get("x"), location.get("y")),
+        "score": score,
+    }
+
+
+def get_building_centroid(building_id):
+    """Return the WGS84 centroid (shapely Point) of a building polygon, or None."""
+    params = {
+        "where": f"building_id={building_id}",
+        "outFields": "building_id",
+        "f": "geojson",
+    }
+
+    try:
+        response = requests.get(BUILDINGS_URL, params=params, timeout=30)
+        response.raise_for_status()
+        features = response.json().get("features", [])
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(f"Building lookup error for building_id={building_id}: {e}")
+        return None
+
+    if not features:
+        return None
+    return shape(features[0]["geometry"]).centroid
+
+
+def get_street_segment(street_id, near_point):
+    """Return the centerline segment (shapely LineString) for street_id nearest
+    to near_point, or None if nothing is returned / on error.
+
+    A street_id can span several block segments, so we pick the one closest to
+    near_point (the building or parcel centroid).
+    """
+    params = {
+        "where": f"street_id={street_id}",
+        "outFields": "full_street_name",
+        "f": "geojson",
+    }
+
+    try:
+        response = requests.get(CENTERLINE_URL, params=params, timeout=30)
+        response.raise_for_status()
+        features = response.json().get("features", [])
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(f"Centerline lookup error for street_id={street_id}: {e}")
+        return None
+
+    # Collect individual LineStrings; flatten MultiLineStrings defensively.
+    segments = []
+    for feature in features:
+        geometry = shape(feature["geometry"])
+        if geometry.geom_type == "MultiLineString":
+            segments.extend(geometry.geoms)
+        else:
+            segments.append(geometry)
+
+    if not segments:
+        return None
+    return min(segments, key=lambda seg: seg.distance(near_point))
+
+
+def frontage_point(segment, near_point):
+    """Nearest point on the street segment to near_point (the building/parcel centroid)."""
+    return segment.interpolate(segment.project(near_point))
+
+
 def get_mapillary_images(lon: float, lat: float, max_results: int = 1000):
     """
     Query Mapillary API for images near a given point.
@@ -127,13 +238,14 @@ def get_mapillary_images(lon: float, lat: float, max_results: int = 1000):
         return []
 
 
-def get_closest_images(images, centroid):
+def get_closest_images(images, anchor):
     """
     Get the closest image for each sequence and the overall closest image.
 
     Parameters:
     - images: List of Mapillary images
-    - parcel_centroid: Shapely Point object
+    - anchor: Shapely Point to measure distance from (the street frontage point
+      when available, otherwise the building or parcel centroid)
 
     Returns:
     - Dictionary with the closest image for each sequence
@@ -145,8 +257,8 @@ def get_closest_images(images, centroid):
 
     # Loop through the images and find the closest image for each sequence
     for i in images:
-        # Compute distance from parcel centroid; assign to image & update closest image if needed
-        distance = centroid.distance(shape(i.get("computed_geometry", i.get("geometry", {}))))
+        # Compute distance from the anchor; assign to image & update closest image if needed
+        distance = anchor.distance(shape(i.get("computed_geometry", i.get("geometry", {}))))
         i["distance"] = distance
         if closest_image_distance is None or distance < closest_image_distance:
             closest_image_distance = distance
@@ -187,10 +299,41 @@ def prepare_post(min_object_id, max_object_id):
         f"Parcel info: https://baseunits.detroitmi.gov/map?id={parcel['properties']['parcel_id']}&layer=parcel"
     ]
 
-    # Compute the parcel's centroid and get Mapillary images near it
+    # Compute the parcel's centroid. This is the universal fallback anchor for
+    # both jobs below if the geocode/lookups don't pan out.
     shapely_geometry = shape(parcel["geometry"])
     centroid = shapely_geometry.centroid
 
+    # Resolve two purpose-built anchors from a single geocode of the address:
+    #   aim_target       - where the camera points (the building, ideally)
+    #   selection_anchor - what image proximity is ranked against (the street
+    #                      frontage, so front-of-house images beat alley ones)
+    # Each step degrades gracefully to the centroid so we always still post.
+    aim_target = centroid
+    selection_anchor = centroid
+
+    geo = geocode_parcel(parcel["properties"]["address"])
+    if geo:
+        if geo["building_id"] is not None:
+            building_centroid = get_building_centroid(geo["building_id"])
+            if building_centroid is not None:
+                aim_target = building_centroid
+
+        # Project the (building, else parcel) centroid onto the matched street
+        # segment to get the on-street point in front of the property.
+        project_from = aim_target
+        if geo["street_id"] is not None:
+            segment = get_street_segment(geo["street_id"], project_from)
+            if segment is not None:
+                selection_anchor = frontage_point(segment, project_from)
+
+    print(f"Aim target: {aim_target.x}, {aim_target.y}")
+    print(f"Selection anchor: {selection_anchor.x}, {selection_anchor.y}")
+
+    # The Mapillary bbox stays centered on the parcel centroid: it is a coarse
+    # retrieval net (~55m), and the frontage re-anchoring happens during ranking
+    # below. (A deep lot whose frontage is >~55m from the centroid is the rare
+    # case where expanding/recentering this bbox could help.)
     images = get_mapillary_images(centroid.x, centroid.y)
     if not images:
         raise SkipParcel("no Mapillary images near parcel")
@@ -198,8 +341,12 @@ def prepare_post(min_object_id, max_object_id):
     # sort images by capture date
     images = sorted(images, key=lambda x: -1 * x["captured_at"])
 
-    # Create a dictionary to store the closest image for each sequence, and track overall closest image
-    sequences, closest_image_distance = get_closest_images(images, centroid)
+    # Rank/select images by proximity to the selection anchor (street frontage
+    # when available). Pure re-ranking — the existing relative 2x-distance filter
+    # below then naturally drops far alley/cross-street images. (A hard
+    # `segment.distance(image) < threshold` drop could be added here if
+    # re-ranking ever proves insufficient.)
+    sequences, closest_image_distance = get_closest_images(images, selection_anchor)
 
     print("Number of sequences:", len(sequences))
     if not sequences:
@@ -274,9 +421,10 @@ def prepare_post(min_object_id, max_object_id):
         print(f"Distance: {i['distance']}")
         print(f"Computed geometry: {coordinates}")
 
-        # Compute the center coordinates for the Mapillary viewer
+        # Compute the center coordinates for the Mapillary viewer, aiming the
+        # panorama at the building (falls back to the parcel centroid).
         computed_center = compute_viewer_center(
-            i, coordinates, [centroid.x, centroid.y]
+            i, coordinates, [aim_target.x, aim_target.y]
         )
 
         print(f"Mapillary link: https://www.mapillary.com/app/?pKey={i['id']}&focus=photo&x={str(computed_center[0])}&y={str(computed_center[1])}")
