@@ -44,6 +44,15 @@ class SkipParcel(Exception):
     """
 
 
+def parcel_attr(props, key, default="Unknown"):
+    """Return a parcel attribute for display, substituting a default for
+    missing or blank values so a sparse parcel still produces a clean post."""
+    value = props.get(key)
+    if value in (None, ""):
+        return default
+    return value
+
+
 def get_parcel_count():
     """Return the total number of parcels in the feature service."""
     params = {"where": "1=1", "returnCountOnly": "true", "f": "json"}
@@ -301,14 +310,30 @@ def prepare_post(parcel_count):
     """
     # Get a random parcel and log information about it
     parcel = get_random_parcel(parcel_count)
+    props = parcel["properties"]
 
-    print(f"Parcel ID: {parcel['properties']['ObjectId']}")
-    print(f"Address: {parcel['properties']['address']}")
+    # The ObjectId is the selection key and is used to name the screenshot
+    # files; without it we can't proceed, so skip rather than build bad paths.
+    object_id = props.get("ObjectId")
+    if object_id is None:
+        raise SkipParcel("parcel has no ObjectId")
+
+    # Address can be missing/blank on some parcels; keep the raw value for
+    # geocoding (only worth attempting when present) and a display version for
+    # the post text and alt text.
+    address = props.get("address") or ""
+    display_address = address or "Unknown address"
+
+    print(f"Parcel ID: {object_id}")
+    print(f"Address: {display_address}")
 
     # build up the reply text
-    reply_text = [
-        f"Parcel info: https://baseunits.detroitmi.gov/map?id={parcel['properties']['parcel_id']}&layer=parcel"
-    ]
+    reply_text = []
+    parcel_id = props.get("parcel_id")
+    if parcel_id:
+        reply_text.append(
+            f"Parcel info: https://baseunits.detroitmi.gov/map?id={parcel_id}&layer=parcel"
+        )
 
     # Compute the parcel's centroid. This is the universal fallback anchor for
     # both jobs below if the geocode/lookups don't pan out.
@@ -323,7 +348,7 @@ def prepare_post(parcel_count):
     aim_target = centroid
     selection_anchor = centroid
 
-    geo = geocode_parcel(parcel["properties"]["address"])
+    geo = geocode_parcel(address) if address else None
     if geo:
         if geo["building_id"] is not None:
             building_centroid = get_building_centroid(geo["building_id"])
@@ -456,7 +481,7 @@ def prepare_post(parcel_count):
                 "--centery",
                 str(computed_center[1]),
                 "--output",
-                f"{parcel['properties']['ObjectId']}_{i['captured_at']}.png",
+                f"{object_id}_{i['captured_at']}.png",
             ]
         )
 
@@ -474,15 +499,13 @@ def prepare_post(parcel_count):
     before_capture_date = datetime.datetime.fromtimestamp(
         max_dist_filtered[closest_key]["captured_at"] / 1000
     ).strftime("%b %d %Y")
-    address = parcel["properties"]["address"]
-    parcel_id = parcel["properties"]["parcel_id"]
-    year_built = parcel["properties"]["year_built"]
-    zoning_district = parcel["properties"]["zoning_district"]
-    tax_status = parcel["properties"]["tax_status"]
+    year_built = parcel_attr(props, "year_built")
+    zoning_district = parcel_attr(props, "zoning_district")
+    tax_status = parcel_attr(props, "tax_status")
 
     # Create the main message text
-    message_text = f"""{address}
-Parcel ID: {parcel_id}
+    message_text = f"""{display_address}
+Parcel ID: {parcel_attr(props, "parcel_id")}
 Year built: {year_built}
 Zoned {zoning_district}
 Tax status: {tax_status}
@@ -493,8 +516,8 @@ Image dates: {before_capture_date} on left; {after_capture_date} on right"""
 
     # Create image paths & alt text
     image_paths = [
-        f"{PROJECT_PATH}/{parcel['properties']['ObjectId']}_{max_dist_filtered[closest_key]['captured_at']}.png",
-        f"{PROJECT_PATH}/{parcel['properties']['ObjectId']}_{max_dist_filtered[first_key]['captured_at']}.png",
+        f"{PROJECT_PATH}/{object_id}_{max_dist_filtered[closest_key]['captured_at']}.png",
+        f"{PROJECT_PATH}/{object_id}_{max_dist_filtered[first_key]['captured_at']}.png",
     ]
 
     # The screenshot subprocess can fail silently (e.g. a Mapillary/network
@@ -505,8 +528,8 @@ Image dates: {before_capture_date} on left; {after_capture_date} on right"""
         raise SkipParcel(f"screenshot(s) not produced: {missing}")
 
     image_alt_texts = [
-        f"Street view imagery of {parcel['properties']['address']} captured on {before_capture_date}",
-        f"Street view imagery of {parcel['properties']['address']} captured on {after_capture_date}",
+        f"Street view imagery of {display_address} captured on {before_capture_date}",
+        f"Street view imagery of {display_address} captured on {after_capture_date}",
     ]
 
     return {
