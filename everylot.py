@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import logging
 import os
 import random
 import requests
@@ -12,6 +13,8 @@ from shapely.geometry import shape, Point
 from bearings import compute_viewer_center
 from bluesky import post_to_bluesky
 from screenshot import capture_screenshots
+
+logger = logging.getLogger("everylot")
 
 # Resolve the project directory so screenshot output paths are absolute.
 PROJECT_PATH = str(Path(__file__).parent.absolute())
@@ -77,7 +80,7 @@ def get_parcel_count_with_retry(attempts=3):
             return get_parcel_count()
         except requests.exceptions.RequestException as e:
             last_error = e
-            print(f"Parcel count fetch attempt {attempt}/{attempts} failed: {e}")
+            logger.warning(f"Parcel count fetch attempt {attempt}/{attempts} failed: {e}")
             if attempt < attempts:
                 time.sleep(2 ** attempt)
     raise last_error
@@ -125,17 +128,17 @@ def geocode_parcel(address):
         response.raise_for_status()
         candidates = response.json().get("candidates", [])
     except (requests.exceptions.RequestException, ValueError) as e:
-        print(f"Geocoder error for {address!r}: {e}")
+        logger.warning(f"Geocoder error for {address!r}: {e}")
         return None
 
     if not candidates:
-        print(f"No geocoder candidates for {address!r}")
+        logger.info(f"No geocoder candidates for {address!r}")
         return None
 
     top = candidates[0]
     score = top.get("score", 0)
     if score < GEOCODE_MIN_SCORE:
-        print(f"Geocoder match for {address!r} too weak (score {score})")
+        logger.info(f"Geocoder match for {address!r} too weak (score {score})")
         return None
 
     attributes = top.get("attributes", {})
@@ -161,7 +164,7 @@ def get_building_centroid(building_id):
         response.raise_for_status()
         features = response.json().get("features", [])
     except (requests.exceptions.RequestException, ValueError) as e:
-        print(f"Building lookup error for building_id={building_id}: {e}")
+        logger.warning(f"Building lookup error for building_id={building_id}: {e}")
         return None
 
     if not features:
@@ -187,7 +190,7 @@ def get_street_segment(street_id, near_point):
         response.raise_for_status()
         features = response.json().get("features", [])
     except (requests.exceptions.RequestException, ValueError) as e:
-        print(f"Centerline lookup error for street_id={street_id}: {e}")
+        logger.warning(f"Centerline lookup error for street_id={street_id}: {e}")
         return None
 
     # Collect individual LineStrings; flatten MultiLineStrings defensively.
@@ -250,15 +253,15 @@ def get_mapillary_images(lon: float, lat: float, max_results: int = 1000):
         data = response.json()
 
         if "data" in data and len(data["data"]) > 0:
-            print(f"Found {len(data['data'])} Mapillary images within {degree_distance}deg of parcel centroid")
+            logger.info(f"Found {len(data['data'])} Mapillary images within {degree_distance}deg of parcel centroid")
             return data["data"]
         else:
-            print(
+            logger.info(
                 f"No Mapillary images found within {degree_distance}deg of parcel centroid"
             )
             return []
     except requests.exceptions.RequestException as e:
-        print(f"Error querying Mapillary API: {e}")
+        logger.warning(f"Error querying Mapillary API: {e}")
         return []
 
 
@@ -322,8 +325,8 @@ def prepare_post(parcel_count):
     address = props.get("address") or ""
     display_address = address or "Unknown address"
 
-    print(f"Parcel ID: {object_id}")
-    print(f"Address: {display_address}")
+    logger.info(f"Parcel ID: {object_id}")
+    logger.info(f"Address: {display_address}")
 
     # build up the reply text
     reply_text = []
@@ -361,8 +364,8 @@ def prepare_post(parcel_count):
             if segment is not None:
                 selection_anchor = frontage_point(segment, project_from)
 
-    print(f"Aim target: {aim_target.x}, {aim_target.y}")
-    print(f"Selection anchor: {selection_anchor.x}, {selection_anchor.y}")
+    logger.info(f"Aim target: {aim_target.x}, {aim_target.y}")
+    logger.info(f"Selection anchor: {selection_anchor.x}, {selection_anchor.y}")
 
     # The Mapillary bbox stays centered on the parcel centroid: it is a coarse
     # retrieval net (~55m), and the frontage re-anchoring happens during ranking
@@ -382,7 +385,7 @@ def prepare_post(parcel_count):
     # re-ranking ever proves insufficient.)
     sequences, closest_image_distance = get_closest_images(images, selection_anchor)
 
-    print("Number of sequences:", len(sequences))
+    logger.info(f"Number of sequences: {len(sequences)}")
     if not sequences:
         raise SkipParcel("no usable image sequences near parcel")
 
@@ -406,7 +409,7 @@ def prepare_post(parcel_count):
     )
 
     sequence_keys = list(max_dist_filtered.keys())
-    print(sequence_keys)
+    logger.info(sequence_keys)
     if not sequence_keys:
         raise SkipParcel("no candidate sequences after filtering")
     first_key = sequence_keys[0]
@@ -431,18 +434,18 @@ def prepare_post(parcel_count):
         distance = image_geometry.distance(first_key_shape)
 
         if closest_distance is None or distance < closest_distance:
-            print(f"New closest distance: {distance} on image {i['id']}")
+            logger.info(f"New closest distance: {distance} on image {i['id']}")
             closest_distance = distance
             closest_key = s
 
-    print(f"Closest image to first image: {closest_key}")
+    logger.info(f"Closest image to first image: {closest_key}")
 
     # No image at least 3 years apart from the first; this parcel can't make a
     # before/after comparison, so move on to another parcel.
     if closest_key is None:
         raise SkipParcel("no before/after pair at least 3 years apart")
 
-    print(f"Mapillary link: https://www.mapillary.com/app/?pKey={max_dist_filtered[closest_key]['id']}")
+    logger.info(f"Mapillary link: https://www.mapillary.com/app/?pKey={max_dist_filtered[closest_key]['id']}")
 
     # Collect the two comparison shots to capture together in one browser below.
     shots = []
@@ -451,12 +454,11 @@ def prepare_post(parcel_count):
 
         coordinates = image_coordinates(i)
 
-        print("\n")
-        print(f"Sequence: {s}")
-        print(f"Image ID: {i['id']}")
-        print(f"Captured at: {datetime.datetime.fromtimestamp(i['captured_at'] / 1000).strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Distance: {i['distance']}")
-        print(f"Computed geometry: {coordinates}")
+        logger.info(f"Sequence: {s}")
+        logger.info(f"Image ID: {i['id']}")
+        logger.info(f"Captured at: {datetime.datetime.fromtimestamp(i['captured_at'] / 1000).strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Distance: {i['distance']}")
+        logger.info(f"Computed geometry: {coordinates}")
 
         # Compute the center coordinates for the Mapillary viewer, aiming the
         # panorama at the building (falls back to the parcel centroid). An image
@@ -471,7 +473,7 @@ def prepare_post(parcel_count):
                 raise SkipParcel(f"image {i['id']} has no compass angle: {e}")
             continue
 
-        print(f"Mapillary link: https://www.mapillary.com/app/?pKey={i['id']}&focus=photo&x={str(computed_center[0])}&y={str(computed_center[1])}")
+        logger.info(f"Mapillary link: https://www.mapillary.com/app/?pKey={i['id']}&focus=photo&x={str(computed_center[0])}&y={str(computed_center[1])}")
 
         # skip screenshotting except for comparison photos
         if s not in [first_key, closest_key]:
@@ -502,7 +504,7 @@ def prepare_post(parcel_count):
             asyncio.wait_for(capture_screenshots(shots), timeout=SCREENSHOT_TIMEOUT)
         )
     except Exception as e:
-        print(f"Screenshot capture failed: {e}")
+        logger.warning(f"Screenshot capture failed: {e}")
 
     # Format attributes for main message text
     after_capture_date = datetime.datetime.fromtimestamp(
@@ -522,9 +524,9 @@ Year built: {year_built}
 Zoned {zoning_district}
 Tax status: {tax_status}
 Image dates: {before_capture_date} on left; {after_capture_date} on right"""
-    print(message_text)
+    logger.info(message_text)
 
-    print("\n".join(reply_text))
+    logger.info("\n".join(reply_text))
 
     # Create image paths & alt text
     image_paths = [
@@ -554,26 +556,30 @@ Image dates: {before_capture_date} on left; {after_capture_date} on right"""
 
 if __name__ == "__main__":
 
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+
     # The parcel count doesn't change within a run, so fetch it once and reuse
     # it across attempts.
     parcel_count = get_parcel_count_with_retry()
 
     post_data = None
     for attempt in range(1, MAX_PARCEL_ATTEMPTS + 1):
-        print(f"\n=== Attempt {attempt}/{MAX_PARCEL_ATTEMPTS} ===")
+        logger.info(f"\n=== Attempt {attempt}/{MAX_PARCEL_ATTEMPTS} ===")
         try:
             post_data = prepare_post(parcel_count)
             break
         except SkipParcel as e:
-            print(f"Skipping parcel: {e}")
+            logger.info(f"Skipping parcel: {e}")
         except requests.exceptions.RequestException as e:
-            print(f"Network error while preparing parcel: {e}")
+            logger.warning(f"Network error while preparing parcel: {e}")
 
     if post_data is None:
         # Couldn't find a postable parcel this run. This is an expected outcome
         # (most parcels have no before/after pair), not a failure, so exit 0 so
         # the scheduled run isn't marked as errored.
-        print(
+        logger.info(
             f"\nNo postable parcel found after {MAX_PARCEL_ATTEMPTS} attempts; "
             "nothing to post this run."
         )
@@ -589,7 +595,7 @@ if __name__ == "__main__":
             image_alt_texts=post_data["image_alt_texts"],
         )
 
-        print("Initial post to Bluesky successful...")
+        logger.info("Initial post to Bluesky successful...")
 
         # Post a reply using the information in `response`
         reply_to = {
@@ -603,7 +609,7 @@ if __name__ == "__main__":
             reply_to=reply_to,
         )
 
-        print("Reply post to Bluesky successful...")
+        logger.info("Reply post to Bluesky successful...")
     finally:
         # Clean up images
         for image_path in post_data["image_paths"]:

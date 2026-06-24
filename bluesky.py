@@ -1,11 +1,14 @@
-import re
+import logging
 import os
+import re
 import time
 
 import httpx
 from atproto import Client
 from atproto_client.exceptions import InvokeTimeoutError, NetworkError
 from typing import List, Dict
+
+logger = logging.getLogger("everylot.bluesky")
 
 # The atproto/Bluesky API occasionally times out (e.g. while uploading an image
 # blob). These are transient, so retry a few times with backoff before failing.
@@ -65,7 +68,7 @@ def post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=
             if attempt == MAX_POST_ATTEMPTS:
                 break
             wait = 2 ** attempt
-            print(
+            logger.warning(
                 f"Bluesky post attempt {attempt}/{MAX_POST_ATTEMPTS} failed "
                 f"({type(e).__name__}); retrying in {wait}s..."
             )

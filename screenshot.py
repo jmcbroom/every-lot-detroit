@@ -1,8 +1,11 @@
-import asyncio
 import argparse
+import asyncio
+import logging
 import os
 
 from playwright.async_api import async_playwright
+
+logger = logging.getLogger("everylot.screenshot")
 
 
 async def _shoot(page, image_key, center_x, center_y, output_path):
@@ -25,7 +28,7 @@ async def _shoot(page, image_key, center_x, center_y, output_path):
         await asyncio.sleep(2)
 
         await page.screenshot(path=output_path)
-        print(f"Screenshot saved to {output_path}")
+        logger.info(f"Screenshot saved to {output_path}")
     finally:
         os.remove(temp_html_path)
 
@@ -130,6 +133,10 @@ async def main():
     parser.add_argument("--centery", type=float, default=0.5, help="Y coordinate for centering the image")
     parser.add_argument("--output", default="screenshot.png", help="Output filename")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
 
     await capture_screenshots(
         [(args.image_key, args.centerx, args.centery, args.output)]
