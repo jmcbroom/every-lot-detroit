@@ -49,7 +49,7 @@ def parse_facets(text: str) -> List[Dict]:
         })
     return facets
 
-def post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=[], reply_to=[]):
+def post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=None, reply_to=None):
     """Post to Bluesky, retrying on transient timeout/network errors.
 
     See _post_to_bluesky for the full parameter documentation.
@@ -74,7 +74,7 @@ def post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=
     raise last_error
 
 
-def _post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=[], reply_to=[]):
+def _post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=None, reply_to=None):
     """
     Post to Bluesky with text and up to two images.
 
@@ -98,6 +98,8 @@ def _post_to_bluesky(username, password, text, image_paths=None, image_alt_texts
 
     if not text and not image_paths:
         raise ValueError("Either text or at least one image is required for a post")
+
+    image_alt_texts = image_alt_texts or []
 
     # Initialize the client and login
     client = Client()
