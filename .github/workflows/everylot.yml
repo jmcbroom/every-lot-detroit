@@ -5,6 +5,11 @@ on:
     - cron: '26,56 * * * *'
   workflow_dispatch:
 
+# Don't let a manual run overlap a scheduled one (or vice versa) and double-post.
+concurrency:
+  group: everylot-post
+  cancel-in-progress: false
+
 jobs:
   post-parcel:
     runs-on: ubuntu-latest
