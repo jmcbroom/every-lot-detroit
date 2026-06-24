@@ -30,13 +30,13 @@ async def take_screenshot(html_content, output_path="screenshot.png"):
             # Load the temporary HTML file
             file_url = f"file://{os.path.abspath(temp_html_path)}"
             await page.goto(file_url)
-            
-            # Wait for network to be idle (ensures JavaScript has executed)
-            await page.wait_for_load_state("networkidle")
-            
-            # Wait a bit longer for the Mapillary viewer to fully load
-            await asyncio.sleep(4)
-            
+
+            # Wait for the viewer to report that the image loaded and the
+            # center/zoom were applied (set via window.__mlyReady), rather than
+            # blindly sleeping. Then give the panorama tiles a short settle.
+            await page.wait_for_function("window.__mlyReady === true", timeout=30000)
+            await asyncio.sleep(2)
+
             # Take a screenshot
             await page.screenshot(path=output_path)
             print(f"Screenshot saved to {output_path}")
@@ -67,7 +67,7 @@ def create_mapillary_html(image_key="1012138957500240", center_x=0.5, center_y=0
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <script src="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.js"></script>
-        <link rel="stylesheet" href="https://unpkg.com/mapillary-js@4.0.0/dist/mapillary.css">
+        <link rel="stylesheet" href="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.css">
         <style>
             body {{
                 margin: 0;
@@ -103,12 +103,16 @@ def create_mapillary_html(image_key="1012138957500240", center_x=0.5, center_y=0
 
             // Wait for the viewer to be fully loaded before setting center and zoom
             mly.on("image", () => {{
-              
+
                 // Set the center position (x, y in normalized coordinates 0-1)
                 mly.setCenter([{center_x}, {center_y}]);
-                
+
                 // Set the zoom level (0 is fully zoomed out)
                 mly.setZoom(0.7);
+
+                // Signal to Playwright that the image loaded and the view was
+                // positioned, so it can wait for this instead of a fixed sleep.
+                window.__mlyReady = true;
             }});
         </script>
     </body>
