@@ -1,8 +1,8 @@
+import asyncio
 import datetime
 import os
 import random
 import requests
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -11,9 +11,9 @@ from shapely.geometry import shape, Point
 
 from bearings import compute_viewer_center
 from bluesky import post_to_bluesky
+from screenshot import capture_screenshots
 
-# Use system Python and set PROJECT_PATH to current directory
-PYTHON_PATH = sys.executable
+# Resolve the project directory so screenshot output paths are absolute.
 PROJECT_PATH = str(Path(__file__).parent.absolute())
 FEATURE_SERVICE_URL = "https://services2.arcgis.com/qvkbeam7Wirps6zC/arcgis/rest/services/parcel_file_current/FeatureServer/0/query"
 
@@ -34,6 +34,10 @@ GEOCODE_MIN_SCORE = 80
 # parcels won't have a Mapillary before/after pair, so we keep sampling until
 # one does (or we run out of attempts).
 MAX_PARCEL_ATTEMPTS = 15
+
+# Hard ceiling on the headless-browser screenshot step so a hung Mapillary
+# viewer can't stall the whole run (the missing-file check then skips the parcel).
+SCREENSHOT_TIMEOUT = 120
 
 
 class SkipParcel(Exception):
@@ -446,6 +450,9 @@ def prepare_post(parcel_count):
 
     print(f"Mapillary link: https://www.mapillary.com/app/?pKey={max_dist_filtered[closest_key]['id']}")
 
+    # Collect the two comparison shots to capture together in one browser below.
+    shots = []
+
     for s, i in max_dist_filtered.items():
 
         coordinates = image_coordinates(i)
@@ -469,20 +476,14 @@ def prepare_post(parcel_count):
         if s not in [first_key, closest_key]:
             continue
 
-        # call screenshot.py with imagekey, centerx, centery params
-        subprocess.run(
-            [
-                PYTHON_PATH,
-                f"{PROJECT_PATH}/screenshot.py",
-                "--image-key",
+        # queue this image for the shared-browser screenshot pass below
+        shots.append(
+            (
                 i["id"],
-                "--centerx",
-                str(computed_center[0]),
-                "--centery",
-                str(computed_center[1]),
-                "--output",
-                f"{object_id}_{i['captured_at']}.png",
-            ]
+                computed_center[0],
+                computed_center[1],
+                f"{PROJECT_PATH}/{object_id}_{i['captured_at']}.png",
+            )
         )
 
         # create image date & add mapillary link to the reply
@@ -491,6 +492,16 @@ def prepare_post(parcel_count):
         ).strftime("%Y-%m-%d")
         mapillary_link = f"{formatted_date}: https://www.mapillary.com/app/?pKey={i['id']}&focus=photo&x={str(computed_center[0])}&y={str(computed_center[1])}"
         reply_text.append(mapillary_link)
+
+    # Capture both comparison screenshots in a single browser session. Failures
+    # (timeouts, render errors) are tolerated here; the missing-file check below
+    # turns a missing screenshot into a SkipParcel so we try another parcel.
+    try:
+        asyncio.run(
+            asyncio.wait_for(capture_screenshots(shots), timeout=SCREENSHOT_TIMEOUT)
+        )
+    except Exception as e:
+        print(f"Screenshot capture failed: {e}")
 
     # Format attributes for main message text
     after_capture_date = datetime.datetime.fromtimestamp(
@@ -520,9 +531,9 @@ Image dates: {before_capture_date} on left; {after_capture_date} on right"""
         f"{PROJECT_PATH}/{object_id}_{max_dist_filtered[first_key]['captured_at']}.png",
     ]
 
-    # The screenshot subprocess can fail silently (e.g. a Mapillary/network
-    # hiccup), leaving us without the images we need. Treat that as a skip so we
-    # try another parcel rather than failing on a missing file at post time.
+    # Screenshot capture can fail (e.g. a Mapillary/network hiccup or timeout),
+    # leaving us without the images we need. Treat that as a skip so we try
+    # another parcel rather than failing on a missing file at post time.
     missing = [p for p in image_paths if not os.path.exists(p)]
     if missing:
         raise SkipParcel(f"screenshot(s) not produced: {missing}")

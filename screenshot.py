@@ -4,46 +4,50 @@ import os
 
 from playwright.async_api import async_playwright
 
-from everylot import PROJECT_PATH
 
-async def take_screenshot(html_content, output_path="screenshot.png"):
-    """
-    Load custom HTML content in a headless browser and take a screenshot using Playwright.
-    
-    Args:
-        html_content (str): HTML content to load
-        output_path (str): Path where the screenshot will be saved
-    """
-    # Create a temporary HTML file
-    temp_html_path = os.path.join(os.getcwd(), "temp_page.html")
+async def _shoot(page, image_key, center_x, center_y, output_path):
+    """Render one Mapillary image in the given page and screenshot it."""
+    html_content = create_mapillary_html(image_key, center_x, center_y)
+
+    # Unique temp file per image so sequential shots don't clash.
+    temp_html_path = os.path.join(os.getcwd(), f"temp_page_{image_key}.html")
     with open(temp_html_path, "w") as f:
         f.write(html_content)
-    
+
+    try:
+        file_url = f"file://{os.path.abspath(temp_html_path)}"
+        await page.goto(file_url)
+
+        # Wait for the viewer to report that the image loaded and the
+        # center/zoom were applied (set via window.__mlyReady), rather than
+        # blindly sleeping. Then give the panorama tiles a short settle.
+        await page.wait_for_function("window.__mlyReady === true", timeout=30000)
+        await asyncio.sleep(2)
+
+        await page.screenshot(path=output_path)
+        print(f"Screenshot saved to {output_path}")
+    finally:
+        os.remove(temp_html_path)
+
+
+async def capture_screenshots(shots):
+    """Screenshot a list of Mapillary images, reusing a single browser.
+
+    Args:
+        shots: iterable of (image_key, center_x, center_y, output_path) tuples.
+    """
     async with async_playwright() as p:
-        # Launch a headless browser
+        # One browser launch covers every shot, instead of one per image.
         browser = await p.chromium.launch(headless=True)
-        
-        # Create a new browser page
-        page = await browser.new_page(viewport={"width": 700, "height": 700})
-        
         try:
-            # Load the temporary HTML file
-            file_url = f"file://{os.path.abspath(temp_html_path)}"
-            await page.goto(file_url)
-
-            # Wait for the viewer to report that the image loaded and the
-            # center/zoom were applied (set via window.__mlyReady), rather than
-            # blindly sleeping. Then give the panorama tiles a short settle.
-            await page.wait_for_function("window.__mlyReady === true", timeout=30000)
-            await asyncio.sleep(2)
-
-            # Take a screenshot
-            await page.screenshot(path=output_path)
-            print(f"Screenshot saved to {output_path}")
+            for image_key, center_x, center_y, output_path in shots:
+                page = await browser.new_page(viewport={"width": 700, "height": 700})
+                try:
+                    await _shoot(page, image_key, center_x, center_y, output_path)
+                finally:
+                    await page.close()
         finally:
-            # Clean up
             await browser.close()
-            os.remove(temp_html_path)
 
 def create_mapillary_html(image_key="1012138957500240", center_x=0.5, center_y=0.5):
     """
@@ -126,9 +130,10 @@ async def main():
     parser.add_argument("--centery", type=float, default=0.5, help="Y coordinate for centering the image")
     parser.add_argument("--output", default="screenshot.png", help="Output filename")
     args = parser.parse_args()
-    
-    html_content = create_mapillary_html(args.image_key, args.centerx, args.centery)
-    await take_screenshot(html_content, args.output)
+
+    await capture_screenshots(
+        [(args.image_key, args.centerx, args.centery, args.output)]
+    )
 
 if __name__ == "__main__":
     # Run the async function
