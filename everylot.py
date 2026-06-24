@@ -43,47 +43,39 @@ class SkipParcel(Exception):
     """
 
 
-def get_object_id_bounds():
-    """Fetch the min and max ObjectId in the parcel feature service."""
-    params = {
-        "outFields": "ObjectId",
-        "where": "1=1",
-        "f": "json",
-        "orderByFields": "ObjectId ASC",
-        "resultRecordCount": 1,
-    }
-
-    response_min = requests.get(FEATURE_SERVICE_URL, params=params, timeout=30)
-    min_object_id = response_min.json()["features"][0]["attributes"]["ObjectId"]
-
-    params["orderByFields"] = "ObjectId DESC"
-    response_max = requests.get(FEATURE_SERVICE_URL, params=params, timeout=30)
-    max_object_id = response_max.json()["features"][0]["attributes"]["ObjectId"]
-
-    return min_object_id, max_object_id
+def get_parcel_count():
+    """Return the total number of parcels in the feature service."""
+    params = {"where": "1=1", "returnCountOnly": "true", "f": "json"}
+    response = requests.get(FEATURE_SERVICE_URL, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()["count"]
 
 
-def get_random_parcel(min_object_id, max_object_id):
-    """Fetch a random parcel within the given ObjectId range.
+def get_random_parcel(parcel_count):
+    """Fetch a parcel at a random offset within the feature service.
 
-    ObjectIds are not contiguous, so a randomly chosen id may not exist. In that
-    case there is no feature to return and we raise SkipParcel so the caller can
-    try again.
+    Selecting by offset (rather than guessing a possibly-nonexistent ObjectId)
+    guarantees a real parcel, so every attempt is spent on the part that matters:
+    whether the parcel has a usable before/after image pair. ArcGIS requires an
+    orderByFields for stable paging when resultOffset is used.
     """
-    random_object_id = random.randint(min_object_id, max_object_id)
+    offset = random.randint(0, parcel_count - 1)
 
-    params_random = {
+    params = {
         "outFields": "*",
-        "where": f"ObjectId={random_object_id}",
+        "where": "1=1",
+        "orderByFields": "ObjectId ASC",
+        "resultOffset": offset,
+        "resultRecordCount": 1,
         "f": "geojson",
     }
 
-    response_random = requests.get(FEATURE_SERVICE_URL, params=params_random, timeout=30)
-    data_random = response_random.json()
+    response = requests.get(FEATURE_SERVICE_URL, params=params, timeout=30)
+    response.raise_for_status()
 
-    features = data_random.get("features", [])
+    features = response.json().get("features", [])
     if not features:
-        raise SkipParcel(f"no parcel with ObjectId={random_object_id}")
+        raise SkipParcel(f"no parcel at offset {offset}")
     return features[0]
 
 
@@ -282,14 +274,14 @@ def image_coordinates(image):
     return geometry["coordinates"]
 
 
-def prepare_post(min_object_id, max_object_id):
+def prepare_post(parcel_count):
     """Pick a random parcel and assemble the before/after post data.
 
     Raises SkipParcel if the parcel can't produce a valid before/after pair.
     Returns a dict with message_text, reply_text, image_paths and image_alt_texts.
     """
     # Get a random parcel and log information about it
-    parcel = get_random_parcel(min_object_id, max_object_id)
+    parcel = get_random_parcel(parcel_count)
 
     print(f"Parcel ID: {parcel['properties']['ObjectId']}")
     print(f"Address: {parcel['properties']['address']}")
@@ -508,15 +500,15 @@ Image dates: {before_capture_date} on left; {after_capture_date} on right"""
 
 if __name__ == "__main__":
 
-    # ObjectId bounds don't change within a run, so fetch them once and reuse
-    # them across attempts.
-    min_object_id, max_object_id = get_object_id_bounds()
+    # The parcel count doesn't change within a run, so fetch it once and reuse
+    # it across attempts.
+    parcel_count = get_parcel_count()
 
     post_data = None
     for attempt in range(1, MAX_PARCEL_ATTEMPTS + 1):
         print(f"\n=== Attempt {attempt}/{MAX_PARCEL_ATTEMPTS} ===")
         try:
-            post_data = prepare_post(min_object_id, max_object_id)
+            post_data = prepare_post(parcel_count)
             break
         except SkipParcel as e:
             print(f"Skipping parcel: {e}")
