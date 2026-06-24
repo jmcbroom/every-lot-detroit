@@ -465,10 +465,17 @@ def prepare_post(parcel_count):
         print(f"Computed geometry: {coordinates}")
 
         # Compute the center coordinates for the Mapillary viewer, aiming the
-        # panorama at the building (falls back to the parcel centroid).
-        computed_center = compute_viewer_center(
-            i, coordinates, [aim_target.x, aim_target.y]
-        )
+        # panorama at the building (falls back to the parcel centroid). An image
+        # without a compass angle can't be aimed: skip the whole parcel if it's
+        # one of the two comparison images, otherwise just ignore that image.
+        try:
+            computed_center = compute_viewer_center(
+                i, coordinates, [aim_target.x, aim_target.y]
+            )
+        except ValueError as e:
+            if s in (first_key, closest_key):
+                raise SkipParcel(f"image {i['id']} has no compass angle: {e}")
+            continue
 
         print(f"Mapillary link: https://www.mapillary.com/app/?pKey={i['id']}&focus=photo&x={str(computed_center[0])}&y={str(computed_center[1])}")
 
