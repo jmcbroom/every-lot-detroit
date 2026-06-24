@@ -1,8 +1,21 @@
 import re
 import os
+import time
 
+import httpx
 from atproto import Client
+from atproto_client.exceptions import InvokeTimeoutError, NetworkError
 from typing import List, Dict
+
+# The atproto/Bluesky API occasionally times out (e.g. while uploading an image
+# blob). These are transient, so retry a few times with backoff before failing.
+RETRYABLE_ERRORS = (
+    InvokeTimeoutError,
+    NetworkError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+)
+MAX_POST_ATTEMPTS = 4
 
 def parse_urls(text: str) -> List[Dict]:
     spans = []
@@ -37,6 +50,31 @@ def parse_facets(text: str) -> List[Dict]:
     return facets
 
 def post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=[], reply_to=[]):
+    """Post to Bluesky, retrying on transient timeout/network errors.
+
+    See _post_to_bluesky for the full parameter documentation.
+    """
+    last_error = None
+    for attempt in range(1, MAX_POST_ATTEMPTS + 1):
+        try:
+            return _post_to_bluesky(
+                username, password, text, image_paths, image_alt_texts, reply_to
+            )
+        except RETRYABLE_ERRORS as e:
+            last_error = e
+            if attempt == MAX_POST_ATTEMPTS:
+                break
+            wait = 2 ** attempt
+            print(
+                f"Bluesky post attempt {attempt}/{MAX_POST_ATTEMPTS} failed "
+                f"({type(e).__name__}); retrying in {wait}s..."
+            )
+            time.sleep(wait)
+
+    raise last_error
+
+
+def _post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=[], reply_to=[]):
     """
     Post to Bluesky with text and up to two images.
 
