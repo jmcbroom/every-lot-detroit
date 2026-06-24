@@ -287,15 +287,9 @@ def get_closest_images(images, anchor):
         if closest_image_distance is None or distance < closest_image_distance:
             closest_image_distance = distance
 
-        # Add image to dictionary if it's the closest for its sequence
-        if i["sequence"] not in sequences.keys():
+        # Keep the closest image seen so far for each sequence.
+        if i["sequence"] not in sequences or distance < sequences[i["sequence"]]["distance"]:
             sequences[i["sequence"]] = i
-        # If the image is closer than the current closest image for the sequence, update
-        else:
-            if distance < sequences[i["sequence"]]["distance"]:
-                sequences[i["sequence"]] = i
-            else:
-                continue
 
     return sequences, closest_image_distance
 
@@ -441,7 +435,7 @@ def prepare_post(parcel_count):
             closest_distance = distance
             closest_key = s
 
-    print(f"Closest iamge to first image: {closest_key}")
+    print(f"Closest image to first image: {closest_key}")
 
     # No image at least 3 years apart from the first; this parcel can't make a
     # before/after comparison, so move on to another parcel.
