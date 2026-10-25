@@ -1,11 +1,12 @@
 import logging
 import os
+import random
 import re
 import time
 
 import httpx
 from atproto import Client
-from atproto_client.exceptions import InvokeTimeoutError, NetworkError
+from atproto_client.exceptions import BadRequestError, InvokeTimeoutError, NetworkError
 from typing import List, Dict
 
 logger = logging.getLogger("everylot.bluesky")
@@ -19,6 +20,62 @@ RETRYABLE_ERRORS = (
     httpx.NetworkError,
 )
 MAX_POST_ATTEMPTS = 4
+
+# Public (unauthenticated) AppView endpoint for reading an account's posts.
+AUTHOR_FEED_URL = "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed"
+
+# Base32-sortable alphabet used by atproto timestamp identifiers (TIDs).
+TID_ALPHABET = "234567abcdefghijklmnopqrstuvwxyz"
+
+
+def generate_tid() -> str:
+    """Generate an atproto TID (13-char, time-sortable record key).
+
+    53 bits of microseconds since the epoch followed by a 10-bit random clock id,
+    encoded big-endian in TID_ALPHABET.
+    """
+    value = ((time.time_ns() // 1000) << 10) | random.getrandbits(10)
+    chars = []
+    for _ in range(13):
+        chars.append(TID_ALPHABET[value & 31])
+        value >>= 5
+    return "".join(reversed(chars))
+
+
+def get_post_texts_since(actor: str, since: str, max_pages: int = 50) -> List[str]:
+    """Return the text of actor's own top-level posts created on or after since.
+
+    actor is a handle or DID; since is a 'YYYY-MM-DD' date (UTC). Reads the
+    public author feed newest-first, so paging stops at the first page reaching
+    back past since. Reposts and replies are excluded. Raises httpx.HTTPError
+    on network/API failure.
+    """
+    texts = []
+    cursor = None
+    for _ in range(max_pages):
+        params = {"actor": actor, "limit": 100, "filter": "posts_no_replies"}
+        if cursor:
+            params["cursor"] = cursor
+        response = httpx.get(AUTHOR_FEED_URL, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        reached_since = False
+        for item in data.get("feed", []):
+            if "reason" in item:  # a repost of someone else's post
+                continue
+            record = item["post"]["record"]
+            # createdAt is ISO 8601 UTC, so the date prefix compares as a string.
+            if record.get("createdAt", "")[:10] < since:
+                reached_since = True
+                continue
+            texts.append(record.get("text", ""))
+
+        cursor = data.get("cursor")
+        if reached_since or not cursor:
+            break
+    return texts
+
 
 def parse_urls(text: str) -> List[Dict]:
     spans = []
@@ -55,13 +112,20 @@ def parse_facets(text: str) -> List[Dict]:
 def post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=None, reply_to=None):
     """Post to Bluesky, retrying on transient timeout/network errors.
 
+    A timed-out request may still have created the post, so every attempt uses
+    the same record key: a retry first checks whether that record already exists
+    (and returns it), and the PDS refuses to create a second record under the
+    same key, so a retry can never double-post.
+
     See _post_to_bluesky for the full parameter documentation.
     """
+    rkey = generate_tid()
     last_error = None
     for attempt in range(1, MAX_POST_ATTEMPTS + 1):
         try:
             return _post_to_bluesky(
-                username, password, text, image_paths, image_alt_texts, reply_to
+                username, password, text, image_paths, image_alt_texts, reply_to,
+                rkey=rkey, check_existing=attempt > 1,
             )
         except RETRYABLE_ERRORS as e:
             last_error = e
@@ -77,7 +141,18 @@ def post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=
     raise last_error
 
 
-def _post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=None, reply_to=None):
+def _get_existing_post(client, rkey):
+    """Return the post stored under rkey in our repo, or None if there isn't one."""
+    try:
+        return client.com.atproto.repo.get_record(
+            {"repo": client.me.did, "collection": "app.bsky.feed.post", "rkey": rkey}
+        )
+    except BadRequestError:
+        # The PDS answers a missing record with 400 RecordNotFound.
+        return None
+
+
+def _post_to_bluesky(username, password, text, image_paths=None, image_alt_texts=None, reply_to=None, rkey=None, check_existing=False):
     """
     Post to Bluesky with text and up to two images.
 
@@ -91,6 +166,10 @@ def _post_to_bluesky(username, password, text, image_paths=None, image_alt_texts
                 - 'uri': The URI of the post to reply to
                 - 'cid': The CID of the post to reply to
                 - 'author': The DID of the author of the post to reply to
+    - rkey: Record key to create the post under (generated if omitted)
+    - check_existing: If True, return the post already stored under rkey
+                      (left by an earlier attempt that timed out) instead of
+                      creating a new one
 
     Returns:
     - Response object from the Bluesky API
@@ -107,6 +186,13 @@ def _post_to_bluesky(username, password, text, image_paths=None, image_alt_texts
     # Initialize the client and login
     client = Client()
     client.login(username, password)
+
+    rkey = rkey or generate_tid()
+    if check_existing:
+        existing = _get_existing_post(client, rkey)
+        if existing is not None:
+            logger.info(f"Post {rkey} already exists from an earlier attempt; not reposting")
+            return existing
 
     # Prepare images if provided
     image_uploads = []
@@ -163,6 +249,7 @@ def _post_to_bluesky(username, password, text, image_paths=None, image_alt_texts
         {
             "repo": client.me.did,
             "collection": "app.bsky.feed.post",
+            "rkey": rkey,
             "record": record,
         }
     )

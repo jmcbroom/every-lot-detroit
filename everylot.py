@@ -1,17 +1,22 @@
 import asyncio
+import csv
 import datetime
 import logging
 import os
 import random
+import re
 import requests
 import sys
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from shapely.geometry import shape, Point
 
 from bearings import compute_viewer_center
-from bluesky import post_to_bluesky
+import httpx
+
+from bluesky import get_post_texts_since, post_to_bluesky
 from screenshot import capture_screenshots
 
 logger = logging.getLogger("everylot")
@@ -19,6 +24,23 @@ logger = logging.getLogger("everylot")
 # Resolve the project directory so screenshot output paths are absolute.
 PROJECT_PATH = str(Path(__file__).parent.absolute())
 FEATURE_SERVICE_URL = "https://services2.arcgis.com/qvkbeam7Wirps6zC/arcgis/rest/services/parcel_file_current/FeatureServer/0/query"
+
+# Which parcels the bot draws from, set via the EVERYLOT_MODE env var:
+#   random  (default) - any parcel in the city
+#   auction           - only parcels sold in the Wayne County tax auction
+#                       (AUCTION_PARCELS_PATH), with the sale amount and winning
+#                       bidder added to the post. A temporary mode; regenerate
+#                       the CSV from the county's PDF with build_auction_list.py.
+MODES = ("random", "auction")
+AUCTION_PARCELS_PATH = f"{PROJECT_PATH}/auction_parcels.csv"
+
+# Auction mode only: skip auction parcels the account has already posted, found
+# by reading its own posts back to this date (UTC), when auction mode started.
+# (Random mode doesn't de-duplicate; repeats among ~380k parcels don't matter.)
+AUCTION_MODE_START = "2026-10-25"
+
+# Matches the "Parcel ID: ..." line of a main post (see prepare_post).
+POSTED_PARCEL_RE = re.compile(r"^Parcel ID: (\S+)$", re.MULTILINE)
 
 # Detroit BaseUnit services used to find a better vantage point for a parcel:
 # geocode the address -> street_id + building_id, then pull the matching street
@@ -42,6 +64,15 @@ MAX_PARCEL_ATTEMPTS = 15
 # viewer can't stall the whole run (the missing-file check then skips the parcel).
 SCREENSHOT_TIMEOUT = 120
 
+# Mapillary capture timestamps are UTC epoch millis; show them as Detroit dates
+# (the Actions runner is UTC, which would push evening captures to the next day).
+DETROIT_TZ = ZoneInfo("America/Detroit")
+
+# Decimal places kept on viewer center coordinates. Full float precision adds
+# ~25 chars per Mapillary link, which can push the reply past Bluesky's
+# 300-character limit; 4 places is ~0.04 degrees of heading, visually identical.
+VIEWER_CENTER_PRECISION = 4
+
 
 class SkipParcel(Exception):
     """Raised when a randomly chosen parcel can't yield a valid before/after pair.
@@ -58,6 +89,32 @@ def parcel_attr(props, key, default="Unknown"):
     if value in (None, ""):
         return default
     return value
+
+
+def format_capture_time(captured_at, fmt):
+    """Format a Mapillary captured_at (epoch millis) in Detroit local time."""
+    return datetime.datetime.fromtimestamp(captured_at / 1000, DETROIT_TZ).strftime(fmt)
+
+
+def load_auction_parcels(path=AUCTION_PARCELS_PATH):
+    """Return the auction sale records (one dict per parcel) from the CSV."""
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def format_sale(sale):
+    """Describe an auction sale for the post, e.g.
+    'Sold at auction for $14,500 to JUDITH ALEMNJUH of NOVI, MI'."""
+    amount = float(sale["sale_amount"])
+    amount_text = f"${amount:,.0f}" if amount.is_integer() else f"${amount:,.2f}"
+
+    # "OT" is the county's code for a bidder outside the US; the city alone
+    # (e.g. STOCKHOLM) reads better than a made-up state.
+    location = sale["bidder_city"]
+    if sale["bidder_state"] != "OT":
+        location = f"{location}, {sale['bidder_state']}"
+
+    return f"Sold at auction for {amount_text} to {sale['bidder_name']} of {location}"
 
 
 def get_parcel_count():
@@ -111,6 +168,23 @@ def get_random_parcel(parcel_count):
     features = response.json().get("features", [])
     if not features:
         raise SkipParcel(f"no parcel at offset {offset}")
+    return features[0]
+
+
+def get_parcel(parcel_id):
+    """Fetch the feature-service parcel with the given parcel_id."""
+    params = {
+        "outFields": "*",
+        "where": "parcel_id='{}'".format(parcel_id.replace("'", "''")),
+        "f": "geojson",
+    }
+
+    response = requests.get(FEATURE_SERVICE_URL, params=params, timeout=30)
+    response.raise_for_status()
+
+    features = response.json().get("features", [])
+    if not features:
+        raise SkipParcel(f"parcel {parcel_id} not found in feature service")
     return features[0]
 
 
@@ -303,14 +377,68 @@ def image_coordinates(image):
     return geometry["coordinates"]
 
 
-def prepare_post(parcel_count):
-    """Pick a random parcel and assemble the before/after post data.
+def parcel_ids_in_posts(texts):
+    """Return the set of parcel IDs named in the given post texts."""
+    return {parcel_id for text in texts for parcel_id in POSTED_PARCEL_RE.findall(text)}
+
+
+def get_posted_auction_parcel_ids():
+    """Return the parcel IDs this account has posted since AUCTION_MODE_START.
+
+    If the account's posts can't be read, returns an empty set (logging a
+    warning): an occasional repeat is better than not posting at all.
+    """
+    actor = os.environ.get("BLUESKY_USERNAME")
+    if not actor:
+        logger.warning("BLUESKY_USERNAME not set; can't check for already-posted parcels")
+        return set()
+    try:
+        texts = get_post_texts_since(actor, AUCTION_MODE_START)
+    except httpx.HTTPError as e:
+        logger.warning(f"Couldn't read posted parcels; repeats are possible this run: {e}")
+        return set()
+    return parcel_ids_in_posts(texts)
+
+
+def parcel_picker(mode):
+    """Return a function that fetches the next candidate as (parcel, sale), or
+    returns None once there are no more candidates.
+
+    sale is the auction sale record in auction mode, otherwise None.
+    """
+    if mode == "auction":
+        # Distinct not-yet-posted auction parcels in random order.
+        sales = load_auction_parcels()
+        posted = get_posted_auction_parcel_ids()
+        unposted = [s for s in sales if s["parcel_id"] not in posted]
+        logger.info(f"{len(unposted)} of {len(sales)} auction parcels not yet posted")
+        remaining = iter(random.sample(unposted, min(MAX_PARCEL_ATTEMPTS, len(unposted))))
+
+        def pick():
+            sale = next(remaining, None)
+            if sale is None:
+                return None
+            return get_parcel(sale["parcel_id"]), sale
+    else:
+        # The parcel count doesn't change within a run, so fetch it once and
+        # reuse it across attempts.
+        parcel_count = get_parcel_count_with_retry()
+
+        def pick():
+            return get_random_parcel(parcel_count), None
+
+    return pick
+
+
+def prepare_post(parcel, sale=None):
+    """Assemble the before/after post data for a parcel.
+
+    sale, if given, is the parcel's auction sale record; its amount and winning
+    bidder are added to the main message.
 
     Raises SkipParcel if the parcel can't produce a valid before/after pair.
     Returns a dict with message_text, reply_text, image_paths and image_alt_texts.
     """
-    # Get a random parcel and log information about it
-    parcel = get_random_parcel(parcel_count)
     props = parcel["properties"]
 
     # The ObjectId is the selection key and is used to name the screenshot
@@ -456,7 +584,7 @@ def prepare_post(parcel_count):
 
         logger.info(f"Sequence: {s}")
         logger.info(f"Image ID: {i['id']}")
-        logger.info(f"Captured at: {datetime.datetime.fromtimestamp(i['captured_at'] / 1000).strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Captured at: {format_capture_time(i['captured_at'], '%Y-%m-%d %H:%M:%S')}")
         logger.info(f"Distance: {i['distance']}")
         logger.info(f"Computed geometry: {coordinates}")
 
@@ -472,6 +600,9 @@ def prepare_post(parcel_count):
             if s in (first_key, closest_key):
                 raise SkipParcel(f"image {i['id']} has no compass angle: {e}")
             continue
+
+        # Round once here so the screenshot and the posted link use the same view.
+        computed_center = [round(c, VIEWER_CENTER_PRECISION) for c in computed_center]
 
         logger.info(f"Mapillary link: https://www.mapillary.com/app/?pKey={i['id']}&focus=photo&x={str(computed_center[0])}&y={str(computed_center[1])}")
 
@@ -490,9 +621,7 @@ def prepare_post(parcel_count):
         )
 
         # create image date & add mapillary link to the reply
-        formatted_date = datetime.datetime.fromtimestamp(
-            i["captured_at"] / 1000
-        ).strftime("%Y-%m-%d")
+        formatted_date = format_capture_time(i["captured_at"], "%Y-%m-%d")
         mapillary_link = f"{formatted_date}: https://www.mapillary.com/app/?pKey={i['id']}&focus=photo&x={str(computed_center[0])}&y={str(computed_center[1])}"
         reply_text.append(mapillary_link)
 
@@ -507,18 +636,19 @@ def prepare_post(parcel_count):
         logger.warning(f"Screenshot capture failed: {e}")
 
     # Format attributes for main message text
-    after_capture_date = datetime.datetime.fromtimestamp(
-        max_dist_filtered[first_key]["captured_at"] / 1000
-    ).strftime("%b %d %Y")
-    before_capture_date = datetime.datetime.fromtimestamp(
-        max_dist_filtered[closest_key]["captured_at"] / 1000
-    ).strftime("%b %d %Y")
+    after_capture_date = format_capture_time(
+        max_dist_filtered[first_key]["captured_at"], "%b %d %Y"
+    )
+    before_capture_date = format_capture_time(
+        max_dist_filtered[closest_key]["captured_at"], "%b %d %Y"
+    )
     year_built = parcel_attr(props, "year_built")
     zoning_district = parcel_attr(props, "zoning_district")
     tax_status = parcel_attr(props, "tax_status")
 
     # Create the main message text
-    message_text = f"""{display_address}
+    sale_line = f"\n{format_sale(sale)}" if sale else ""
+    message_text = f"""{display_address}{sale_line}
 Parcel ID: {parcel_attr(props, "parcel_id")}
 Year built: {year_built}
 Zoned {zoning_district}
@@ -560,15 +690,22 @@ if __name__ == "__main__":
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
 
-    # The parcel count doesn't change within a run, so fetch it once and reuse
-    # it across attempts.
-    parcel_count = get_parcel_count_with_retry()
+    mode = os.environ.get("EVERYLOT_MODE") or "random"
+    if mode not in MODES:
+        sys.exit(f"Unknown EVERYLOT_MODE {mode!r}; expected one of {MODES}")
+    logger.info(f"Mode: {mode}")
+    pick_parcel = parcel_picker(mode)
 
     post_data = None
     for attempt in range(1, MAX_PARCEL_ATTEMPTS + 1):
         logger.info(f"\n=== Attempt {attempt}/{MAX_PARCEL_ATTEMPTS} ===")
         try:
-            post_data = prepare_post(parcel_count)
+            candidate = pick_parcel()
+            if candidate is None:
+                logger.info("No more candidate parcels")
+                break
+            parcel, sale = candidate
+            post_data = prepare_post(parcel, sale)
             break
         except SkipParcel as e:
             logger.info(f"Skipping parcel: {e}")

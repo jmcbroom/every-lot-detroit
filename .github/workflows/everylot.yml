@@ -33,4 +33,7 @@ jobs:
           BLUESKY_USERNAME: ${{ secrets.BLUESKY_USERNAME }}
           BLUESKY_PASSWORD: ${{ secrets.BLUESKY_PASSWORD }}
           MAPILLARY_ACCESS_TOKEN: ${{ secrets.MAPILLARY_ACCESS_TOKEN }}
+          # Temporary: post only parcels sold in the 2026 Wayne County tax
+          # auction. Remove this line to go back to random city parcels.
+          EVERYLOT_MODE: auction
         run: python everylot.py
