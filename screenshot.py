@@ -7,6 +7,10 @@ from playwright.async_api import async_playwright
 
 logger = logging.getLogger("everylot.screenshot")
 
+# A 700x700 PNG of a rendered panorama is far larger than an unrendered black
+# canvas (just the zoom buttons), which is a few KB. Under this is blank.
+MIN_SCREENSHOT_BYTES = 20_000
+
 
 async def _shoot(page, image_key, center_x, center_y, output_path):
     """Render one Mapillary image in the given page and screenshot it."""
@@ -21,13 +25,35 @@ async def _shoot(page, image_key, center_x, center_y, output_path):
         file_url = f"file://{os.path.abspath(temp_html_path)}"
         await page.goto(file_url)
 
-        # Wait for the viewer to report that the image loaded and the
-        # center/zoom were applied (set via window.__mlyReady), rather than
-        # blindly sleeping. Then give the panorama tiles a short settle.
-        await page.wait_for_function("window.__mlyReady === true", timeout=30000)
+        # Wait until the center/zoom were applied AND the viewer's "load" event
+        # (first visually complete render) has fired; the "image" event alone
+        # fires before the panorama is drawn and could leave a black frame.
+        # Then give the higher-res tiles for the new view a short settle.
+        await page.wait_for_function(
+            "window.__mlyReady === true && window.__mlyLoaded === true",
+            timeout=30000,
+        )
         await asyncio.sleep(2)
 
-        await page.screenshot(path=output_path)
+        # If the panorama still hasn't drawn, the frame is (nearly) all black
+        # and compresses to a tiny PNG. Wait once more, then give up without
+        # writing the file, so the caller skips this parcel instead of posting
+        # a black image.
+        for attempt in range(2):
+            png = await page.screenshot()
+            if len(png) >= MIN_SCREENSHOT_BYTES:
+                break
+            logger.warning(
+                f"Screenshot of {image_key} looks blank ({len(png)} bytes), "
+                f"attempt {attempt + 1}"
+            )
+            await asyncio.sleep(5)
+        else:
+            logger.warning(f"Giving up on blank screenshot of {image_key}")
+            return
+
+        with open(output_path, "wb") as f:
+            f.write(png)
         logger.info(f"Screenshot saved to {output_path}")
     finally:
         os.remove(temp_html_path)
@@ -106,6 +132,11 @@ def create_mapillary_html(image_key="1012138957500240", center_x=0.5, center_y=0
                   cache: true,
                   direction: false,
                 }}
+            }});
+
+            // "load" fires after the first visually complete render.
+            mly.on("load", () => {{
+                window.__mlyLoaded = true;
             }});
 
             // Wait for the viewer to be fully loaded before setting center and zoom
