@@ -73,6 +73,10 @@ DETROIT_TZ = ZoneInfo("America/Detroit")
 # 300-character limit; 4 places is ~0.04 degrees of heading, visually identical.
 VIEWER_CENTER_PRECISION = 4
 
+# Floor (in degrees, ~10m) on the distance cutoff for candidate image sequences;
+# see filter_nearby_sequences. Small enough to exclude the alley behind a lot.
+MIN_SEQUENCE_DISTANCE = 0.0001
+
 
 class SkipParcel(Exception):
     """Raised when a randomly chosen parcel can't yield a valid before/after pair.
@@ -371,6 +375,27 @@ def get_closest_images(images, anchor):
     return sequences, closest_image_distance
 
 
+def filter_nearby_sequences(sequences, closest_image_distance):
+    """Narrow sequences to the ones close enough to the anchor to compare.
+
+    Keeps sequences within 2x the closest image's distance, but never narrower
+    than MIN_SEQUENCE_DISTANCE: with the street-frontage anchor the closest
+    image is often <1m away, and a purely relative cutoff would then leave a
+    single sequence, which can never form a before/after pair. Then keeps the
+    closest 66% of those, but at least two (when two survive) so a pair is
+    still possible. Returns them ordered newest capture first.
+    """
+    by_distance = sorted(sequences.items(), key=lambda x: x[1]["distance"])
+
+    cutoff = max(closest_image_distance * 2, MIN_SEQUENCE_DISTANCE)
+    nearby = [(k, v) for k, v in by_distance if v["distance"] < cutoff]
+
+    keep = max(min(2, len(nearby)), int(len(nearby) / 1.5))
+    nearby = nearby[:keep]
+
+    return dict(sorted(nearby, key=lambda x: -x[1]["captured_at"]))
+
+
 def image_coordinates(image):
     """Return an image's coordinates, preferring computed_geometry over geometry."""
     geometry = image.get("computed_geometry", image.get("geometry", {}))
@@ -517,24 +542,7 @@ def prepare_post(parcel, sale=None):
     if not sequences:
         raise SkipParcel("no usable image sequences near parcel")
 
-    # sort sequences by distance
-    max_dist_filtered = dict(
-        sorted(sequences.items(), key=lambda x: x[1]["distance"])
-    )
-
-    # filter down to 2x closest image distance
-    max_dist_filtered = {
-        k: v for k, v in max_dist_filtered.items() if v["distance"] < (closest_image_distance * 2)
-    }
-
-    # filter down to the closest 66% of sequences, but always keep at least one
-    keep = max(1, int(len(max_dist_filtered) / 1.5))
-    max_dist_filtered = dict(list(max_dist_filtered.items())[:keep])
-
-    # re-sort by captured date
-    max_dist_filtered = dict(
-        sorted(max_dist_filtered.items(), key=lambda x: x[1]["captured_at"] * -1)
-    )
+    max_dist_filtered = filter_nearby_sequences(sequences, closest_image_distance)
 
     sequence_keys = list(max_dist_filtered.keys())
     logger.info(sequence_keys)

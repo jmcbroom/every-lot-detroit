@@ -3,7 +3,7 @@ from shapely.geometry import Point
 
 import everylot
 
-from everylot import parcel_attr, image_coordinates, get_closest_images, format_capture_time, format_sale, load_auction_parcels
+from everylot import parcel_attr, image_coordinates, get_closest_images, filter_nearby_sequences, format_capture_time, format_sale, load_auction_parcels
 
 
 def test_parcel_attr_returns_present_value():
@@ -143,3 +143,38 @@ def test_parcel_ids_in_posts():
         "Parcel info: https://baseunits.detroitmi.gov/map?id=01002263.&layer=parcel",
     ]
     assert everylot.parcel_ids_in_posts(texts) == {"01002263.", "01003671.003"}
+
+
+def _seq(distance, captured_at):
+    return {"distance": distance, "captured_at": captured_at}
+
+
+def test_filter_nearby_sequences_floor_keeps_close_sequences():
+    # Frontage anchor: closest image is ~0.4m away. A purely relative 2x cutoff
+    # would keep only "a"; the floor keeps the other sequences a few meters off.
+    sequences = {
+        "a": _seq(3.9e-6, 300),
+        "b": _seq(3e-5, 200),
+        "c": _seq(5e-5, 100),
+        "alley": _seq(4e-4, 50),
+    }
+    result = filter_nearby_sequences(sequences, 3.9e-6)
+    assert "alley" not in result
+    assert len(result) >= 2
+
+
+def test_filter_nearby_sequences_relative_cutoff_still_applies_when_far():
+    sequences = {"a": _seq(0.0002, 1), "b": _seq(0.00039, 2), "c": _seq(0.0005, 3)}
+    result = filter_nearby_sequences(sequences, 0.0002)
+    assert set(result) == {"a", "b"}
+
+
+def test_filter_nearby_sequences_keeps_both_of_two():
+    sequences = {"a": _seq(1e-5, 1), "b": _seq(2e-5, 2)}
+    assert set(filter_nearby_sequences(sequences, 1e-5)) == {"a", "b"}
+
+
+def test_filter_nearby_sequences_newest_first():
+    sequences = {"old": _seq(1e-5, 1), "new": _seq(2e-5, 3), "mid": _seq(3e-5, 2)}
+    # 66% of 3 keeps the two closest (old, new), then orders them newest first.
+    assert list(filter_nearby_sequences(sequences, 1e-5)) == ["new", "old"]
